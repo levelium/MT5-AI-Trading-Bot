@@ -1004,7 +1004,7 @@ bool AIApproveFVG(FVGZone &fvg, string direction, double entry, double sl, doubl
       "\"lot\":" + DoubleToString(lot, 2) + "," +
       "\"atr\":" + DoubleToString(atr, _Digits) + "," +
       "\"spread_points\":" + DoubleToString(spread / _Point, 1) + "," +
-      "\"max_spread_points\":" + DoubleToString(MaxSpreadPoints, 1) + "," +
+      "\"max_spread_points\":" + DoubleToString(MaxSpreadPoints > 0 ? (MaxSpreadPoints * GetPipScale()) : 0.0, 1) + "," +
       "\"equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "," +
       "\"balance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "," +
       "\"daily_pl\":" + DoubleToString(dailyPL + MathMin(0.0, floatingPL), 2) + "," +
