@@ -60,6 +60,14 @@ input int    KZ_NYEnd        = 21;        // NY session end (GMT)
 input bool   KZ_PreferOverlap= false;     // Only trade overlap (highest quality)
 input bool   CloseAtEOD      = false;     // Close all at session end
 
+//--- Inputs: Execution & Order Placement -----------------------------+
+enum ENUM_EXECUTION_MODE
+{
+   EXEC_MARKET = 0, // Direct Market Order (trade.Buy / trade.Sell)
+   EXEC_LIMIT  = 1  // Limit Order at FVG boundary (trade.BuyLimit / trade.SellLimit)
+};
+input ENUM_EXECUTION_MODE ExecutionMode = EXEC_MARKET; // Order Execution Mode (Market vs Limit)
+
 //--- Inputs: Misc ----------------------------------------------------+
 input ulong  MagicNumber     = 7777;
 input int    SlippagePoints  = 20;
@@ -120,7 +128,7 @@ string    lastAIStatusText = "AI service not yet checked";
 int OnInit()
 {
    trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetDeviationInPoints((ulong)SlippagePoints);
+   trade.SetDeviationInPoints((ulong)(SlippagePoints * GetPipScale()));
    trade.SetTypeFillingBySymbol(Symbol());
 
    hEMAfast_htf = iMA(Symbol(), HTF_Period, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
@@ -169,6 +177,18 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, "FVG_");
    ObjectsDeleteAll(0, "OB_");
    Comment("");
+}
+
+//+------------------------------------------------------------------+
+//| Auto-detect point multiplier for 3-digit gold / 5-digit forex    |
+//| Standard gold: 2 digits (_Point = 0.01)  -> scale multiplier 1.0 |
+//| Exness gold:   3 digits (_Point = 0.001) -> scale multiplier 10.0|
+//+------------------------------------------------------------------+
+double GetPipScale()
+{
+   int d = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
+   if(d == 3 || d == 5) return 10.0;
+   return 1.0;
 }
 
 //+------------------------------------------------------------------+
@@ -352,7 +372,7 @@ void DetectOrderBlocks()
 
       if(obType == 0) continue;
       double obSize = (obTop - obBot) / point;
-      if(obSize < OB_MinSize) continue;
+      if(obSize < OB_MinSize * GetPipScale()) continue;
 
       bool exists = false;
       for(int j = 0; j < ArraySize(obZones); j++)
@@ -406,7 +426,7 @@ void PruneOBs()
 bool HasOBConfluence(FVGZone &fvg)
 {
    double point = SymbolInfoDouble(Symbol(), SYMBOL_POINT);
-   double maxDist = OB_MaxDistance * point;
+   double maxDist = OB_MaxDistance * point * GetPipScale();
 
    for(int i = 0; i < ArraySize(obZones); i++)
    {
@@ -535,7 +555,7 @@ void DetectFVGs()
       if(fvgType == 0) continue;
 
       double gapSize = (gapTop - gapBot) / point;
-      if(gapSize < MinGapSize) continue;
+      if(gapSize < MinGapSize * GetPipScale()) continue;
 
       int fvgAgeBars = iBarShift(Symbol(), FVGTimeframe, t1, false);
       if(fvgAgeBars < MinAgeBars || fvgAgeBars > MaxAgeBars) continue;
@@ -1007,8 +1027,15 @@ bool AIApproveFVG(FVGZone &fvg, string direction, double entry, double sl, doubl
    string confidenceText = JSONValue(response, "confidence");
    double confidence = StringToDouble(confidenceText);
    string reason = JSONValue(response, "reason");
+   string marketBias = JSONValue(response, "market_bias");
+   string setupQuality = JSONValue(response, "setup_quality");
+   string invalidation = JSONValue(response, "invalidation_reason");
    
-   Print("Gemini Review: Decision=", decision, " Approved=", approved, " Confidence=", DoubleToString(confidence, 2), " Reason=", reason);
+   Print("Gemini Review: Decision=", decision, " Approved=", approved, " Conf=", DoubleToString(confidence, 2), 
+         " Bias=", marketBias, " Quality=", setupQuality, " Reason=", reason);
+   if(invalidation != "")
+      Print("Gemini Invalidation Note: ", invalidation);
+
    if(approved != "true" || decision != direction || confidence < AIApprovalConfidence)
    {
       Print("AI FAIL-CLOSED: Candidate rejected by AI or failed confidence threshold (", DoubleToString(confidence, 2), " < ", DoubleToString(AIApprovalConfidence, 2), ")");
@@ -1018,7 +1045,7 @@ bool AIApproveFVG(FVGZone &fvg, string direction, double entry, double sl, doubl
 }
 
 //+------------------------------------------------------------------+
-//| Place limit order at FVG boundary/midpoint                       |
+//| Place order at FVG boundary or immediate Market Execution        |
 //+------------------------------------------------------------------+
 void PlaceFVGOrder(FVGZone &fvg)
 {
@@ -1030,9 +1057,10 @@ void PlaceFVGOrder(FVGZone &fvg)
    double ask     = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
    double bid     = SymbolInfoDouble(Symbol(), SYMBOL_BID);
    double spread  = ask - bid;
-   if(MaxSpreadPoints > 0 && spread / point > MaxSpreadPoints)
+   double maxAllowedSpreadPoints = MaxSpreadPoints * GetPipScale();
+   if(MaxSpreadPoints > 0 && spread / point > maxAllowedSpreadPoints)
    {
-      Print("AI risk gate: Spread too high (", DoubleToString(spread / point, 1), " points > ", DoubleToString(MaxSpreadPoints, 1), ")");
+      Print("AI risk gate: Spread too high (", DoubleToString(spread / point, 1), " points > ", DoubleToString(maxAllowedSpreadPoints, 1), " max)");
       return;
    }
    long   stopLvl = SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL);
@@ -1049,10 +1077,10 @@ void PlaceFVGOrder(FVGZone &fvg)
 
    if(fvg.type == 1)
    {
-      double entry = fvg.bottom + FVGBuffer * 0.5;
+      double entry = (ExecutionMode == EXEC_MARKET) ? ask : (fvg.bottom + FVGBuffer * 0.5);
       double sl    = fvg.bottom - FVGBuffer;
       slDist = entry - sl;
-      if(ask - entry < minDist) return;
+      if(ExecutionMode == EXEC_LIMIT && (ask - entry < minDist)) return;
       if(sl >= entry) return;
 
       double lot = CalcLot(slDist);
@@ -1062,23 +1090,40 @@ void PlaceFVGOrder(FVGZone &fvg)
       
       if(!AIApproveFVG(fvg, "BUY", entry, sl, tp, lot, atr, spread, GetHTFBias())) return;
 
-      if(trade.BuyLimit(lot, entry, Symbol(), sl, tp, ORDER_TIME_GTC, 0, tag))
+      if(ExecutionMode == EXEC_MARKET)
       {
-         fvg.orderPlaced = true;
-         Print("FVG BuyLimit Placed: ", tag, " @ ", DoubleToString(entry, 2),
-               " SL=", DoubleToString(sl, 2), " TP=", DoubleToString(tp, 2),
-               " Score=", DoubleToString(fvg.score, 0),
-               " R:R=", DoubleToString((tp - entry) / (entry - sl), 1));
+         if(trade.Buy(lot, _Symbol, 0.0, sl, tp, tag))
+         {
+            fvg.orderPlaced = true;
+            Print("FVG Market BUY Placed: ", tag, " lot=", DoubleToString(lot, 2),
+                  " @ ", DoubleToString(ask, _Digits),
+                  " SL=", DoubleToString(sl, _Digits), " TP=", DoubleToString(tp, _Digits),
+                  " Score=", DoubleToString(fvg.score, 0),
+                  " R:R=", DoubleToString((tp - entry) / (entry - sl), 1));
+         }
+         else
+            Print("Market Buy failed: ", tag, " retcode=", IntegerToString(trade.ResultRetcode()));
       }
       else
-         Print("BuyLimit failed: ", tag, " retcode=", IntegerToString(trade.ResultRetcode()));
+      {
+         if(trade.BuyLimit(lot, entry, Symbol(), sl, tp, ORDER_TIME_GTC, 0, tag))
+         {
+            fvg.orderPlaced = true;
+            Print("FVG BuyLimit Placed: ", tag, " @ ", DoubleToString(entry, 2),
+                  " SL=", DoubleToString(sl, 2), " TP=", DoubleToString(tp, 2),
+                  " Score=", DoubleToString(fvg.score, 0),
+                  " R:R=", DoubleToString((tp - entry) / (entry - sl), 1));
+         }
+         else
+            Print("BuyLimit failed: ", tag, " retcode=", IntegerToString(trade.ResultRetcode()));
+      }
    }
    else
    {
-      double entry = fvg.top - FVGBuffer * 0.5;
+      double entry = (ExecutionMode == EXEC_MARKET) ? bid : (fvg.top - FVGBuffer * 0.5);
       double sl    = fvg.top + FVGBuffer;
       slDist = sl - entry;
-      if(entry - bid < minDist) return;
+      if(ExecutionMode == EXEC_LIMIT && (entry - bid < minDist)) return;
       if(sl <= entry) return;
 
       double lot = CalcLot(slDist);
@@ -1088,16 +1133,33 @@ void PlaceFVGOrder(FVGZone &fvg)
       
       if(!AIApproveFVG(fvg, "SELL", entry, sl, tp, lot, atr, spread, GetHTFBias())) return;
 
-      if(trade.SellLimit(lot, entry, Symbol(), sl, tp, ORDER_TIME_GTC, 0, tag))
+      if(ExecutionMode == EXEC_MARKET)
       {
-         fvg.orderPlaced = true;
-         Print("FVG SellLimit Placed: ", tag, " @ ", DoubleToString(entry, 2),
-               " SL=", DoubleToString(sl, 2), " TP=", DoubleToString(tp, 2),
-               " Score=", DoubleToString(fvg.score, 0),
-               " R:R=", DoubleToString((entry - tp) / (sl - entry), 1));
+         if(trade.Sell(lot, _Symbol, 0.0, sl, tp, tag))
+         {
+            fvg.orderPlaced = true;
+            Print("FVG Market SELL Placed: ", tag, " lot=", DoubleToString(lot, 2),
+                  " @ ", DoubleToString(bid, _Digits),
+                  " SL=", DoubleToString(sl, _Digits), " TP=", DoubleToString(tp, _Digits),
+                  " Score=", DoubleToString(fvg.score, 0),
+                  " R:R=", DoubleToString((entry - tp) / (sl - entry), 1));
+         }
+         else
+            Print("Market Sell failed: ", tag, " retcode=", IntegerToString(trade.ResultRetcode()));
       }
       else
-         Print("SellLimit failed: ", tag, " retcode=", IntegerToString(trade.ResultRetcode()));
+      {
+         if(trade.SellLimit(lot, entry, Symbol(), sl, tp, ORDER_TIME_GTC, 0, tag))
+         {
+            fvg.orderPlaced = true;
+            Print("FVG SellLimit Placed: ", tag, " @ ", DoubleToString(entry, 2),
+                  " SL=", DoubleToString(sl, 2), " TP=", DoubleToString(tp, 2),
+                  " Score=", DoubleToString(fvg.score, 0),
+                  " R:R=", DoubleToString((entry - tp) / (sl - entry), 1));
+         }
+         else
+            Print("SellLimit failed: ", tag, " retcode=", IntegerToString(trade.ResultRetcode()));
+      }
    }
 }
 
